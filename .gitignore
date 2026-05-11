@@ -1,6 +1,9 @@
 opencodego.config.json
 opencodego.models.cache.json
 opencodego.litellm.generated.yaml
+.env
+.env.*
+!.env.example
 *.log
 __pycache__/
 *.pyc

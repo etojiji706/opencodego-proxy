@@ -40,6 +40,8 @@ ends and the next request starts from the next workspace.
 - Stale model removal when upstreams are successfully checked
 - LiteLLM YAML-like model config generation
 - Proxy Bearer auth for `/v1/*`
+- Dependency-free `.env` loading before config validation
+- Workspace API keys must use `api_key_env`; plaintext `api_key` config is rejected
 - API keys and Authorization headers are not logged
 - Built-in self-test using fake local upstreams
 
@@ -47,6 +49,8 @@ ends and the next request starts from the next workspace.
 
 ```text
 .
+├── .env.example
+├── .gitignore
 ├── README.md
 └── opencodego.py
 ```
@@ -68,43 +72,53 @@ below.
 
 ## Quick Start
 
-1. Create a config file:
+1. Create a local `.env` file:
+
+```bash
+cp .env.example .env
+```
+
+2. Fill `.env` with your client-facing proxy token and workspace keys. The values below are
+   placeholders; use real secrets only in your local `.env`, never in Git:
+
+```env
+OPENCODEGO_PROXY_API_KEY=<local-proxy-token>
+OPENCODE_GO_API_KEY_1=<workspace-1-api-key>
+OPENCODE_GO_API_KEY_2=<workspace-2-api-key>
+OPENCODE_GO_API_KEY_3=<workspace-3-api-key>
+OPENCODE_GO_API_KEY_4=<workspace-4-api-key>
+```
+
+`.env` is ignored by Git. Do not commit it.
+
+3. Create a config file:
 
 ```bash
 python3 opencodego.py init-config ./opencodego.config.json
 ```
 
-2. Edit `opencodego.config.json` and replace the sample upstream URLs with your workspace URLs.
+4. Edit `opencodego.config.json` and replace the sample upstream URLs with your workspace URLs.
+   Keep `api_key_env`; plaintext `api_key` is rejected at startup.
 
-3. Export secrets in the shell, not in Git:
-
-```bash
-export OPENCODEGO_PROXY_API_KEY="change-this-client-facing-token"
-export OPENCODEGO_WS1_API_KEY="workspace-1-secret"
-export OPENCODEGO_WS2_API_KEY="workspace-2-secret"
-export OPENCODEGO_WS3_API_KEY="workspace-3-secret"
-export OPENCODEGO_WS4_API_KEY="workspace-4-secret"
-```
-
-4. Run the built-in verification:
+5. Run the built-in verification:
 
 ```bash
 python3 -B opencodego.py --verbose self-test
 ```
 
-5. Start the proxy:
+6. Start the proxy:
 
 ```bash
 python3 -B opencodego.py serve --config ./opencodego.config.json
 ```
 
-6. Check health:
+7. Check health:
 
 ```bash
 curl http://127.0.0.1:8088/health
 ```
 
-7. Query models through the proxy:
+8. Query models through the proxy:
 
 ```bash
 curl http://127.0.0.1:8088/v1/models \
@@ -128,12 +142,12 @@ curl http://127.0.0.1:8088/v1/models \
     {
       "name": "workspace-1",
       "base_url": "https://workspace-1.example.com/v1",
-      "api_key_env": "OPENCODEGO_WS1_API_KEY"
+      "api_key_env": "OPENCODE_GO_API_KEY_1"
     },
     {
       "name": "workspace-2",
       "base_url": "https://workspace-2.example.com/v1",
-      "api_key_env": "OPENCODEGO_WS2_API_KEY"
+      "api_key_env": "OPENCODE_GO_API_KEY_2"
     }
   ]
 }
@@ -149,13 +163,19 @@ curl http://127.0.0.1:8088/v1/models \
 - `model_cache_path`: local model cache file.
 - `litellm_generated_config_path`: optional generated LiteLLM model config path.
 - `litellm_proxy_api_base`: the URL LiteLLM should use to call this proxy.
-- `litellm_proxy_api_key_env`: env var that stores the client-facing proxy token.
+- `litellm_proxy_api_key_env`: env var that stores the client-facing proxy token. Keep the token in
+  the environment or `.env`; inline proxy keys are not supported.
+- `env_file`: optional `.env` path to load before validation. By default, `opencodego.py` loads
+  `.env` from the current working directory if it exists. Set this to `false`, `null`, or `""` to
+  disable config-driven `.env` loading, or use global CLI `--env-file PATH` / `--no-env-file`.
 - `workspaces[].name`: stable workspace id used in logs.
 - `workspaces[].base_url`: upstream OpenAI-compatible base URL, usually ending in `/v1`.
 - `workspaces[].api_key_env`: env var that stores that workspace API key.
 - `workspaces[].models_path`: optional override, default `/v1/models`.
 
-Prefer `api_key_env`. Do not put real `api_key` values in a public repository.
+Every workspace must define `api_key_env`. Workspaces whose env var is missing or empty after `.env`
+loading are disabled; if all workspaces are disabled, startup fails. Plaintext `api_key` values are
+rejected and must not be committed.
 
 ## LiteLLM Setup
 
@@ -283,9 +303,11 @@ upstream `Authorization` with the selected workspace API key.
 ## Security Notes
 
 - Keep `listen_host` as `127.0.0.1` by default.
-- Set `OPENCODEGO_PROXY_API_KEY` before exposing the proxy to anything beyond localhost.
+- Set `OPENCODEGO_PROXY_API_KEY` even for local development, and always before exposing the proxy to
+  anything beyond localhost.
 - Never commit real API keys.
-- Prefer env vars over inline config secrets.
+- Use `.env` or runtime environment variables for secrets. Plaintext workspace `api_key` config and
+  inline client proxy keys are rejected/not supported.
 - Do not publish generated cache/config files if they contain private model names or internal URLs.
 - Logs avoid request bodies, API keys, Authorization headers, and chunk contents.
 
@@ -295,6 +317,9 @@ Suggested `.gitignore`:
 opencodego.config.json
 opencodego.models.cache.json
 opencodego.litellm.generated.yaml
+.env
+.env.*
+!.env.example
 *.log
 __pycache__/
 *.pyc
@@ -355,23 +380,24 @@ If you are an AI agent applying this repository to a user's environment, follow 
    handling.
 4. Run `python3 -B opencodego.py --help`.
 5. Run `python3 -B opencodego.py --verbose self-test`.
-6. Create config with `init-config`.
-7. Replace sample `base_url` values with the user's OpenCode Go/OpenAI-compatible workspace URLs.
-8. Ensure every workspace uses `api_key_env`, not inline `api_key`.
-9. Export or document required env vars:
+6. Create `.env` from `.env.example` and have the user fill real values outside Git.
+7. Create config with `init-config`.
+8. Replace sample `base_url` values with the user's OpenCode Go/OpenAI-compatible workspace URLs.
+9. Ensure every workspace uses `api_key_env`, not inline `api_key`.
+10. Export or document required env vars:
    - `OPENCODEGO_PROXY_API_KEY`
-   - `OPENCODEGO_WS1_API_KEY`
-   - `OPENCODEGO_WS2_API_KEY`
+   - `OPENCODE_GO_API_KEY_1`
+   - `OPENCODE_GO_API_KEY_2`
    - additional workspace keys as needed
-10. Start the proxy locally.
-11. Verify `/health`.
-12. Verify `/v1/models` with Bearer auth.
-13. Run `sync-models --force`.
-14. Generate LiteLLM config with `print-litellm-config` or inspect the generated file.
-15. Configure LiteLLM to use this proxy's `/v1` API base and `OPENCODEGO_PROXY_API_KEY`.
-16. Test non-streaming chat completion.
-17. Test streaming chat completion.
-18. Only after local verification, help the user decide whether to expose the proxy beyond
+11. Start the proxy locally.
+12. Verify `/health`.
+13. Verify `/v1/models` with Bearer auth.
+14. Run `sync-models --force`.
+15. Generate LiteLLM config with `print-litellm-config` or inspect the generated file.
+16. Configure LiteLLM to use this proxy's `/v1` API base and `OPENCODEGO_PROXY_API_KEY`.
+17. Test non-streaming chat completion.
+18. Test streaming chat completion.
+19. Only after local verification, help the user decide whether to expose the proxy beyond
     localhost.
 
 Do not change these behavioral contracts unless the user explicitly asks:
@@ -381,6 +407,7 @@ Do not change these behavioral contracts unless the user explicitly asks:
 - Streaming failures must terminate the current stream and move the next request to the next
   workspace.
 - API keys and request/chunk contents must not be logged.
+- Plaintext workspace `api_key` values must be rejected; use `api_key_env`.
 - Model sync may add/remove model entries, but must not alter defaults, costs, priorities, routing
   weights, categories, or temperature presets.
 

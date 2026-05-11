@@ -32,9 +32,8 @@ not log request bodies, API keys, Authorization headers, or chunk contents.
 Usage:
 
     python opencodego.py init-config ./opencodego.config.json
-    export OPENCODEGO_PROXY_API_KEY="replace-with-client-facing-secret"
-    export OPENCODEGO_WS1_API_KEY="replace-with-real-secret-outside-git"
-    export OPENCODEGO_WS2_API_KEY="replace-with-real-secret-outside-git"
+    cp .env.example .env
+    # Fill .env with OPENCODEGO_PROXY_API_KEY and OPENCODE_GO_API_KEY_1...
     python opencodego.py serve --config ./opencodego.config.json
     python opencodego.py sync-models --config ./opencodego.config.json
     python opencodego.py print-litellm-config --config ./opencodego.config.json
@@ -54,19 +53,19 @@ Minimal config example:
         {
           "name": "workspace-1",
           "base_url": "https://workspace-1.example.com/v1",
-          "api_key_env": "OPENCODEGO_WS1_API_KEY"
+          "api_key_env": "OPENCODE_GO_API_KEY_1"
         },
         {
           "name": "workspace-2",
           "base_url": "https://workspace-2.example.com/v1",
-          "api_key_env": "OPENCODEGO_WS2_API_KEY"
+          "api_key_env": "OPENCODE_GO_API_KEY_2"
         }
       ]
     }
 
 Public safety notes:
 
-* Do not commit real API keys. Prefer api_key_env over api_key.
+* Do not commit real API keys. Inline api_key config is rejected; use api_key_env.
 * Set OPENCODEGO_PROXY_API_KEY before exposing the proxy outside localhost.
 * Logs never print configured API keys or client Authorization headers.
 * The generated LiteLLM config contains model entries only. It does not set or
@@ -105,6 +104,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 APP_NAME = "opencodego"
 CONFIG_ENV = "OPENCODEGO_CONFIG"
+DEFAULT_ENV_FILE = ".env"
 DEFAULT_TTL_SECONDS = 24 * 60 * 60
 DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024
@@ -129,6 +129,7 @@ HOP_BY_HOP_HEADERS = {
     "authorization",
 }
 STRIPPED_FORWARD_HEADERS = HOP_BY_HOP_HEADERS | {"accept-encoding"}
+ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def utc_now() -> _dt.datetime:
@@ -150,14 +151,6 @@ def parse_time(value: object) -> Optional[_dt.datetime]:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=_dt.timezone.utc)
     return parsed.astimezone(_dt.timezone.utc)
-
-
-def redact(value: Optional[str]) -> str:
-    if not value:
-        return "<unset>"
-    if len(value) <= 8:
-        return "<redacted>"
-    return f"{value[:2]}...{value[-2:]}(redacted)"
 
 
 def read_json_file(path: str) -> Dict[str, Any]:
@@ -195,11 +188,115 @@ class ConfigError(ValueError):
     pass
 
 
+def _strip_unquoted_env_comment(value: str) -> str:
+    for index, char in enumerate(value):
+        if char == "#" and (index == 0 or value[index - 1].isspace()):
+            return value[:index].rstrip()
+    return value.rstrip()
+
+
+def _parse_double_quoted_env_value(value: str, path: str, line_number: int) -> str:
+    output: List[str] = []
+    escaped = False
+    for index, char in enumerate(value[1:], start=1):
+        if escaped:
+            output.append(
+                {
+                    "n": "\n",
+                    "r": "\r",
+                    "t": "\t",
+                    "\\": "\\",
+                    '"': '"',
+                    "#": "#",
+                    "$": "$",
+                }.get(char, char)
+            )
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == '"':
+            trailing = value[index + 1 :].strip()
+            if trailing and not trailing.startswith("#"):
+                raise ConfigError(f"invalid .env syntax at {path}:{line_number}")
+            return "".join(output)
+        output.append(char)
+    raise ConfigError(f"unterminated quoted value in .env at {path}:{line_number}")
+
+
+def _parse_single_quoted_env_value(value: str, path: str, line_number: int) -> str:
+    end_index = value.find("'", 1)
+    if end_index < 0:
+        raise ConfigError(f"unterminated quoted value in .env at {path}:{line_number}")
+    trailing = value[end_index + 1 :].strip()
+    if trailing and not trailing.startswith("#"):
+        raise ConfigError(f"invalid .env syntax at {path}:{line_number}")
+    return value[1:end_index]
+
+
+def parse_env_line(line: str, path: str, line_number: int) -> Optional[Tuple[str, str]]:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    if stripped.startswith("export "):
+        stripped = stripped[len("export ") :].lstrip()
+    if "=" not in stripped:
+        raise ConfigError(f"invalid .env line at {path}:{line_number}; expected KEY=VALUE")
+    key, raw_value = stripped.split("=", 1)
+    key = key.strip()
+    if not ENV_KEY_RE.fullmatch(key):
+        raise ConfigError(f"invalid env var name in .env at {path}:{line_number}")
+    value = raw_value.strip()
+    if value.startswith('"'):
+        return key, _parse_double_quoted_env_value(value, path, line_number)
+    if value.startswith("'"):
+        return key, _parse_single_quoted_env_value(value, path, line_number)
+    return key, _strip_unquoted_env_comment(value)
+
+
+def load_env_file(path: str, required: bool = False) -> int:
+    if not os.path.exists(path):
+        if required:
+            raise ConfigError(f"env file not found: {path}")
+        return 0
+    loaded = 0
+    with open(path, "r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            parsed = parse_env_line(line, path, line_number)
+            if parsed is None:
+                continue
+            key, value = parsed
+            if key not in os.environ:
+                os.environ[key] = value
+                loaded += 1
+    logging.getLogger("opencodego.config").info("loaded env file path=%s variables=%s", path, loaded)
+    return loaded
+
+
+def resolve_env_file(
+    config_data: Mapping[str, Any],
+    cli_env_file: Optional[str] = None,
+    load_env: bool = True,
+) -> Tuple[Optional[str], bool]:
+    if not load_env:
+        return None, False
+    if cli_env_file:
+        return cli_env_file, True
+    if "env_file" not in config_data:
+        return DEFAULT_ENV_FILE, False
+    configured = config_data.get("env_file")
+    if configured is None or configured is False or configured == "":
+        return None, False
+    if not isinstance(configured, str):
+        raise ConfigError("env_file must be a string path, null, false, or empty string")
+    return configured, True
+
+
 @dataclasses.dataclass(frozen=True)
 class WorkspaceConfig:
     name: str
     base_url: str
-    api_key: Optional[str] = None
     api_key_env: Optional[str] = None
     models_path: str = "/v1/models"
 
@@ -214,19 +311,18 @@ class WorkspaceConfig:
         parsed = urllib.parse.urlsplit(base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ConfigError(f"{name}: base_url must be an absolute http(s) URL")
-        api_key = data.get("api_key")
+        if "api_key" in data:
+            raise ConfigError(f"{name}: plaintext api_key is not allowed; use api_key_env")
         api_key_env = data.get("api_key_env")
-        if api_key is not None and not isinstance(api_key, str):
-            raise ConfigError(f"{name}: api_key must be a string when provided")
-        if api_key_env is not None and not isinstance(api_key_env, str):
-            raise ConfigError(f"{name}: api_key_env must be a string when provided")
+        if not isinstance(api_key_env, str) or not api_key_env.strip():
+            raise ConfigError(f"{name}: api_key_env is required")
+        api_key_env = api_key_env.strip()
         models_path = str(data.get("models_path") or "/v1/models")
         if not models_path.startswith("/"):
             models_path = "/" + models_path
         return cls(
             name=name,
             base_url=base_url.rstrip("/"),
-            api_key=api_key,
             api_key_env=api_key_env,
             models_path=models_path,
         )
@@ -234,7 +330,7 @@ class WorkspaceConfig:
     def resolved_api_key(self) -> str:
         if self.api_key_env:
             return os.environ.get(self.api_key_env, "")
-        return self.api_key or ""
+        return ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -252,10 +348,24 @@ class AppConfig:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "AppConfig":
+        for forbidden_key in ("litellm_proxy_api_key", "proxy_api_key", "client_proxy_api_key"):
+            if forbidden_key in data and data.get(forbidden_key) is not None:
+                raise ConfigError(f"{forbidden_key} is not allowed; use litellm_proxy_api_key_env")
         raw_workspaces = data.get("workspaces")
         if not isinstance(raw_workspaces, list) or not raw_workspaces:
             raise ConfigError("config requires a non-empty workspaces array")
-        workspaces = tuple(WorkspaceConfig.from_dict(i, item) for i, item in enumerate(raw_workspaces))
+        parsed_workspaces = tuple(WorkspaceConfig.from_dict(i, item) for i, item in enumerate(raw_workspaces))
+        enabled_workspaces: List[WorkspaceConfig] = []
+        config_log = logging.getLogger("opencodego.config")
+        for workspace in parsed_workspaces:
+            env_name = workspace.api_key_env or ""
+            if os.environ.get(env_name, "").strip():
+                enabled_workspaces.append(workspace)
+                continue
+            config_log.warning("workspace disabled name=%s api_key_env=%s", workspace.name, env_name)
+        if not enabled_workspaces:
+            raise ConfigError("no enabled workspaces; configure at least one workspace api_key_env in the environment or .env")
+        workspaces = tuple(enabled_workspaces)
         listen_host = str(data.get("listen_host") or "127.0.0.1")
         listen_port = int(data.get("listen_port") or 8088)
         timeout = float(data.get("request_timeout_seconds") or DEFAULT_TIMEOUT_SECONDS)
@@ -293,11 +403,23 @@ class AppConfig:
         return self.litellm_proxy_api_base or f"http://{self.listen_host}:{self.listen_port}/v1"
 
 
-def load_config(path: Optional[str]) -> AppConfig:
+def load_config(
+    path: Optional[str],
+    env_file: Optional[str] = None,
+    load_env: bool = True,
+) -> AppConfig:
     config_path = path or os.environ.get(CONFIG_ENV)
     if not config_path:
         raise ConfigError(f"provide --config or set {CONFIG_ENV}")
-    return AppConfig.from_dict(read_json_file(config_path))
+    data = read_json_file(config_path)
+    selected_env_file, env_file_required = resolve_env_file(
+        data,
+        cli_env_file=env_file,
+        load_env=load_env,
+    )
+    if selected_env_file:
+        load_env_file(selected_env_file, required=env_file_required)
+    return AppConfig.from_dict(data)
 
 
 def sample_config() -> Dict[str, Any]:
@@ -315,7 +437,7 @@ def sample_config() -> Dict[str, Any]:
             {
                 "name": f"workspace-{i}",
                 "base_url": f"https://workspace-{i}.example.com/v1",
-                "api_key_env": f"OPENCODEGO_WS{i}_API_KEY",
+                "api_key_env": f"OPENCODE_GO_API_KEY_{i}",
             }
             for i in range(1, 5)
         ],
@@ -704,11 +826,11 @@ class WorkspaceRouter:
         request_headers["Accept-Encoding"] = "identity"
         request_headers.setdefault("User-Agent", f"{APP_NAME}/1.0")
         self.log.debug(
-            "forward workspace=%s method=%s url=%s api_key=%s",
+            "forward workspace=%s method=%s url=%s api_key_env=%s",
             workspace.name,
             method,
             url,
-            redact(api_key),
+            workspace.api_key_env or "<unset>",
         )
         return urllib.request.Request(
             url,
@@ -865,12 +987,12 @@ class WorkspaceRouter:
             request_headers.setdefault("User-Agent", f"{APP_NAME}/1.0")
 
             self.log.debug(
-                "forward attempt=%s workspace=%s method=%s url=%s api_key=%s",
+                "forward attempt=%s workspace=%s method=%s url=%s api_key_env=%s",
                 attempt + 1,
                 workspace.name,
                 method,
                 url,
-                redact(api_key),
+                workspace.api_key_env or "<unset>",
             )
 
             request = urllib.request.Request(
@@ -1575,7 +1697,7 @@ def command_init_config(args: argparse.Namespace) -> int:
 
 
 def command_sync_models(args: argparse.Namespace) -> int:
-    config = load_config(args.config)
+    config = load_config(args.config, env_file=args.env_file, load_env=not args.no_env_file)
     registry = ModelRegistry(config)
     models = registry.sync(force=args.force)
     print(f"models available in cache: {len(models)}")
@@ -1585,7 +1707,7 @@ def command_sync_models(args: argparse.Namespace) -> int:
 
 
 def command_print_litellm_config(args: argparse.Namespace) -> int:
-    config = load_config(args.config)
+    config = load_config(args.config, env_file=args.env_file, load_env=not args.no_env_file)
     registry = ModelRegistry(config)
     models = registry.sync(force=args.refresh)
     print(render_litellm_config(models, config), end="")
@@ -1593,7 +1715,7 @@ def command_print_litellm_config(args: argparse.Namespace) -> int:
 
 
 def command_serve(args: argparse.Namespace) -> int:
-    config = load_config(args.config)
+    config = load_config(args.config, env_file=args.env_file, load_env=not args.no_env_file)
     if args.host:
         config = dataclasses.replace(config, listen_host=args.host)
     if args.port:
@@ -1739,8 +1861,113 @@ def start_fake_upstream(
 def command_self_test(args: argparse.Namespace) -> int:
     setup_logging(verbose=args.verbose)
     servers: List[ThreadingHTTPServer] = []
-    old_proxy_key = os.environ.get("OPENCODEGO_TEST_PROXY_KEY")
+    managed_env_keys = [
+        "OPENCODEGO_TEST_KEY_ONE",
+        "OPENCODEGO_TEST_KEY_TWO",
+        "OPENCODEGO_TEST_PROXY_KEY",
+        "OPENCODE_GO_TEST_API_KEY_1",
+        "OPENCODE_GO_TEST_API_KEY_2",
+        "OPENCODE_GO_TEST_API_KEY_3",
+        "OPENCODE_GO_TEST_API_KEY_4",
+        "OPENCODE_GO_TEST_REQUIRED_KEY",
+    ]
+    old_env = {key: os.environ.get(key) for key in managed_env_keys}
+    old_cwd = os.getcwd()
     with tempfile.TemporaryDirectory(prefix="opencodego-test-") as temp_dir:
+        for key in managed_env_keys:
+            os.environ.pop(key, None)
+
+        env_config_path = os.path.join(temp_dir, "env-config.json")
+        atomic_write_json(
+            env_config_path,
+            {
+                "listen_host": "127.0.0.1",
+                "listen_port": 8088,
+                "workspaces": [
+                    {
+                        "name": "env-workspace-1",
+                        "base_url": "https://workspace-1.example.com/v1",
+                        "api_key_env": "OPENCODE_GO_TEST_API_KEY_1",
+                    },
+                    {
+                        "name": "env-workspace-2",
+                        "base_url": "https://workspace-2.example.com/v1",
+                        "api_key_env": "OPENCODE_GO_TEST_API_KEY_2",
+                    },
+                ],
+            },
+        )
+        atomic_write_text(
+            os.path.join(temp_dir, DEFAULT_ENV_FILE),
+            "OPENCODE_GO_TEST_API_KEY_1=env-loaded-key\n",
+        )
+        try:
+            os.chdir(temp_dir)
+            loaded_env_config = load_config(env_config_path)
+        finally:
+            os.chdir(old_cwd)
+        assert os.environ.get("OPENCODE_GO_TEST_API_KEY_1") == "env-loaded-key"
+        assert [workspace.name for workspace in loaded_env_config.workspaces] == ["env-workspace-1"]
+
+        plaintext_config_path = os.path.join(temp_dir, "plaintext-config.json")
+        atomic_write_json(
+            plaintext_config_path,
+            {
+                "workspaces": [
+                    {
+                        "name": "plaintext-workspace",
+                        "base_url": "https://workspace.example.com/v1",
+                        "api_key": "must-not-appear-in-error",
+                        "api_key_env": "OPENCODE_GO_TEST_API_KEY_1",
+                    }
+                ]
+            },
+        )
+        try:
+            load_config(plaintext_config_path, load_env=False)
+            raise AssertionError("expected plaintext api_key to be rejected")
+        except ConfigError as exc:
+            message = str(exc)
+            assert "api_key_env" in message, message
+            assert "must-not-appear-in-error" not in message, message
+
+        missing_api_key_env_config_path = os.path.join(temp_dir, "missing-api-key-env-config.json")
+        atomic_write_json(
+            missing_api_key_env_config_path,
+            {
+                "workspaces": [
+                    {
+                        "name": "missing-api-key-env-workspace",
+                        "base_url": "https://workspace.example.com/v1",
+                    }
+                ]
+            },
+        )
+        try:
+            load_config(missing_api_key_env_config_path, load_env=False)
+            raise AssertionError("expected missing api_key_env to be rejected")
+        except ConfigError as exc:
+            assert "api_key_env is required" in str(exc), str(exc)
+
+        all_missing_config_path = os.path.join(temp_dir, "all-missing-config.json")
+        atomic_write_json(
+            all_missing_config_path,
+            {
+                "workspaces": [
+                    {
+                        "name": "all-missing-workspace",
+                        "base_url": "https://workspace.example.com/v1",
+                        "api_key_env": "OPENCODE_GO_TEST_API_KEY_4",
+                    }
+                ]
+            },
+        )
+        try:
+            load_config(all_missing_config_path, load_env=False)
+            raise AssertionError("expected all missing env keys to fail")
+        except ConfigError as exc:
+            assert "no enabled workspaces" in str(exc), str(exc)
+
         server1, url1, state1 = start_fake_upstream(
             "workspace-1",
             "key-one",
@@ -1979,10 +2206,12 @@ def command_self_test(args: argparse.Namespace) -> int:
     for server in servers:
         server.shutdown()
         server.server_close()
-    if old_proxy_key is None:
-        os.environ.pop("OPENCODEGO_TEST_PROXY_KEY", None)
-    else:
-        os.environ["OPENCODEGO_TEST_PROXY_KEY"] = old_proxy_key
+    os.chdir(old_cwd)
+    for key, value in old_env.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
     print("self-test passed")
     return 0
 
@@ -1993,6 +2222,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="OpenCode Go x LiteLLM circular failover proxy and model sync helper.",
     )
     parser.add_argument("--verbose", action="store_true", help="enable debug logging")
+    env_group = parser.add_mutually_exclusive_group()
+    env_group.add_argument(
+        "--env-file",
+        help="load KEY=VALUE pairs from PATH before config validation; defaults to .env",
+    )
+    env_group.add_argument("--no-env-file", action="store_true", help="do not load .env")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     init_config = subparsers.add_parser("init-config", help="write a safe sample JSON config")
