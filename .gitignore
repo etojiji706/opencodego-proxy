@@ -1,0 +1,7 @@
+opencodego.config.json
+opencodego.models.cache.json
+opencodego.litellm.generated.yaml
+*.log
+__pycache__/
+*.pyc
+.DS_Store
